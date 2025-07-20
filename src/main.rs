@@ -1,18 +1,17 @@
 #![feature(rustc_private)]
 #![feature(impl_trait_in_assoc_type)]
 
+extern crate rustc_abi;
+extern crate rustc_codegen_ssa;
+extern crate rustc_const_eval;
+extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
-extern crate rustc_session;
 extern crate rustc_monomorphize;
-extern crate regex_syntax;
-extern crate rustc_codegen_ssa;
-extern crate rustc_data_structures;
+extern crate rustc_session;
 extern crate rustc_span;
-extern crate rustc_abi;
-extern crate rustc_const_eval;
 
 fn main() {
     let handler = EarlyDiagCtxt::new(ErrorOutputType::default());
@@ -30,79 +29,93 @@ fn main() {
 
 use std::{collections::HashMap, env};
 
-use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar};
-use rustc_hir::{self as hir, LangItem};
 use rustc_codegen_ssa::errors;
+use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_driver::{run_compiler, Callbacks, Compilation};
-use rustc_hir::{def_id::{DefId, LocalDefId}, intravisit::Visitor};
-use rustc_middle::{middle::codegen_fn_attrs::CodegenFnAttrFlags, mir::{self, mono::{CollectionMode, MonoItem}}, ty::{self, layout::ValidityRequirement, GenericArgs, GenericParamDefKind, Instance, Ty, TyCtxt}};
-use rustc_session::{config::{EntryFnType, ErrorOutputType}, EarlyDiagCtxt};
+use rustc_hir::{self as hir, LangItem};
+use rustc_hir::{
+    def_id::{DefId, LocalDefId},
+    intravisit::Visitor,
+};
+use rustc_middle::{
+    middle::codegen_fn_attrs::CodegenFnAttrFlags,
+    mir::{
+        self,
+        mono::{CollectionMode, MonoItem},
+    },
+    ty::{
+        self, layout::ValidityRequirement, GenericArgs, GenericParamDefKind, Instance, Ty, TyCtxt,
+    },
+};
+use rustc_session::{
+    config::{EntryFnType, ErrorOutputType},
+    EarlyDiagCtxt,
+};
 
 struct ProjectAnalyzer;
 
 impl Callbacks for ProjectAnalyzer {
-
     fn after_expansion<'tcx>(
         &mut self,
         _compiler: &rustc_interface::interface::Compiler,
-        tcx:TyCtxt<'tcx>,
+        tcx: TyCtxt<'tcx>,
     ) -> rustc_driver::Compilation {
         analyze_deps(tcx);
-        
+
         Compilation::Continue
     }
 
-    fn after_analysis<'tcx>(
-            &mut self,
-            _compiler: &rustc_interface::interface::Compiler,
-            tcx: TyCtxt<'tcx>,
-        ) -> Compilation {
-        let roots = collect_roots(tcx, MonoItemCollectionStrategy::Eager);
+    // fn after_analysis<'tcx>(
+    //         &mut self,
+    //         _compiler: &rustc_interface::interface::Compiler,
+    //         tcx: TyCtxt<'tcx>,
+    //     ) -> Compilation {
+    //     let roots = collect_roots(tcx, MonoItemCollectionStrategy::Eager);
 
-        let mut user_map : HashMap<DefId, HashMap<MonoItem<'tcx>, usize>> = Default::default();
-        for r in roots {
-            match r {
-                MonoItem::Fn(instance) => {
-                    let x = tcx.items_of_instance((instance, CollectionMode::UsedItems));
-                    for item in x.0.into_iter().chain(x.1) {
-                        
-                        *user_map.entry(instance.def_id()).or_default()
-                            .entry(item.node).or_default() += 1;
-                        
-                        // .entry(item.node.def_id()).or_default() += 1;
-                    }
-                },
-               _ => (),
-            }
-        }
+    //     let mut user_map : HashMap<DefId, HashMap<MonoItem<'tcx>, usize>> = Default::default();
+    //     for r in roots {
+    //         match r {
+    //             MonoItem::Fn(instance) => {
+    //                 let x = tcx.items_of_instance((instance, CollectionMode::UsedItems));
+    //                 for item in x.0.into_iter().chain(x.1) {
 
-       let mut sorted : Vec<_> = user_map.into_iter().collect(); 
-       sorted.sort_by_key(|k| k.1.iter().map(|(m, c)| c * m.size_estimate(tcx)).sum::<usize>());
-       sorted.reverse();
-        // sorted.sort_by_key(|k| k.1.values().sum::<usize>() );
+    //                     *user_map.entry(instance.def_id()).or_default()
+    //                         .entry(item.node).or_default() += 1;
 
-        for (k, v) in &sorted[0..1] {
-            if !k.is_local() {
-                continue
-            }
+    //                     // .entry(item.node.def_id()).or_default() += 1;
+    //                 }
+    //             },
+    //            _ => (),
+    //         }
+    //     }
 
-            eprintln!("{}", tcx.def_path_str(k));
+    //    let mut sorted : Vec<_> = user_map.into_iter().collect();
+    //    sorted.sort_by_key(|k| k.1.iter().map(|(m, c)| c * m.size_estimate(tcx)).sum::<usize>());
+    //    sorted.reverse();
+    //     // sorted.sort_by_key(|k| k.1.values().sum::<usize>() );
 
-            let mut items : Vec<_> = v.clone().into_iter().collect();
-            items.sort_by_key(|(m, c)| c * m.size_estimate(tcx));
-            items.reverse();
-            for (v, _) in items {
-                if let MonoItem::Fn(instance) = v {
-                    if !instance.def_id().is_local() {
-                        continue;
-                    }
-                    eprintln!("  {} {}", tcx.def_path_str_with_args(instance.def_id(), instance.args), tcx.size_estimate(instance))
-                }
-            }
-        }
-        Compilation::Continue
-    }
+    //     for (k, v) in &sorted[0..1] {
+    //         if !k.is_local() {
+    //             continue
+    //         }
+
+    //         eprintln!("{}", tcx.def_path_str(k));
+
+    //         let mut items : Vec<_> = v.clone().into_iter().collect();
+    //         items.sort_by_key(|(m, c)| c * m.size_estimate(tcx));
+    //         items.reverse();
+    //         for (v, _) in items {
+    //             if let MonoItem::Fn(instance) = v {
+    //                 if !instance.def_id().is_local() {
+    //                     continue;
+    //                 }
+    //                 eprintln!("  {} {}", tcx.def_path_str_with_args(instance.def_id(), instance.args), tcx.size_estimate(instance))
+    //             }
+    //         }
+    //     }
+    //     Compilation::Continue
+    // }
 }
 
 fn analyze_deps(tcx: TyCtxt) {
@@ -113,7 +126,10 @@ fn analyze_deps(tcx: TyCtxt) {
 
 struct PrintItem<'tcx>(TyCtxt<'tcx>);
 use rustc_hir::def::DefKind;
-use rustc_span::{source_map::{dummy_spanned, respan, Spanned}, Span, DUMMY_SP};
+use rustc_span::{
+    source_map::{dummy_spanned, respan, Spanned},
+    Span, DUMMY_SP,
+};
 
 impl<'tcx> Visitor<'tcx> for PrintItem<'tcx> {
     fn visit_use(
@@ -161,7 +177,6 @@ fn collect_roots(tcx: TyCtxt<'_>, mode: MonoItemCollectionStrategy) -> Vec<MonoI
     {
         let entry_fn = tcx.entry_fn(());
 
-
         let mut collector = RootCollector {
             tcx,
             strategy: mode,
@@ -195,7 +210,6 @@ fn collect_roots(tcx: TyCtxt<'_>, mode: MonoItemCollectionStrategy) -> Vec<MonoI
         .collect()
 }
 
-
 struct RootCollector<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     strategy: MonoItemCollectionStrategy,
@@ -210,7 +224,6 @@ impl<'v> RootCollector<'_, 'v> {
                 if self.strategy == MonoItemCollectionStrategy::Eager
                     && self.tcx.generics_of(id.owner_id).is_empty()
                 {
-
                     // This type is impossible to instantiate, so we should not try to
                     // generate a `drop_in_place` instance for it.
                     if self.tcx.instantiate_and_check_impossible_predicates((
@@ -220,12 +233,15 @@ impl<'v> RootCollector<'_, 'v> {
                         return;
                     }
 
-                    let ty = self.tcx.type_of(id.owner_id.to_def_id()).no_bound_vars().unwrap();
+                    let ty = self
+                        .tcx
+                        .type_of(id.owner_id.to_def_id())
+                        .no_bound_vars()
+                        .unwrap();
                     visit_drop_use(self.tcx, ty, true, DUMMY_SP, self.output);
                 }
             }
             DefKind::GlobalAsm => {
-                
                 self.output.push(dummy_spanned(MonoItem::GlobalAsm(id)));
             }
             DefKind::Static { .. } => {
@@ -260,7 +276,10 @@ impl<'v> RootCollector<'_, 'v> {
     }
 
     fn is_root(&self, def_id: LocalDefId) -> bool {
-        !self.tcx.generics_of(def_id).requires_monomorphization(self.tcx)
+        !self
+            .tcx
+            .generics_of(def_id)
+            .requires_monomorphization(self.tcx)
             && match self.strategy {
                 MonoItemCollectionStrategy::Eager => true,
                 MonoItemCollectionStrategy::Lazy => {
@@ -279,9 +298,9 @@ impl<'v> RootCollector<'_, 'v> {
     /// outputs. (Note that all roots must be monomorphic.)
     fn push_if_root(&mut self, def_id: LocalDefId) {
         if self.is_root(def_id) {
-
             let instance = Instance::mono(self.tcx, def_id.to_def_id());
-            self.output.push(create_fn_mono_item(self.tcx, instance, DUMMY_SP));
+            self.output
+                .push(create_fn_mono_item(self.tcx, instance, DUMMY_SP));
         }
     }
 
@@ -298,7 +317,12 @@ impl<'v> RootCollector<'_, 'v> {
         let Some(start_def_id) = self.tcx.lang_items().start_fn() else {
             todo!()
         };
-        let main_ret_ty = self.tcx.fn_sig(main_def_id).no_bound_vars().unwrap().output();
+        let main_ret_ty = self
+            .tcx
+            .fn_sig(main_def_id)
+            .no_bound_vars()
+            .unwrap()
+            .output();
 
         // Given that `main()` has no arguments,
         // then its return type cannot have
@@ -318,7 +342,8 @@ impl<'v> RootCollector<'_, 'v> {
             DUMMY_SP,
         );
 
-        self.output.push(create_fn_mono_item(self.tcx, start_instance, DUMMY_SP));
+        self.output
+            .push(create_fn_mono_item(self.tcx, start_instance, DUMMY_SP));
     }
 }
 
@@ -327,7 +352,6 @@ fn create_fn_mono_item<'tcx>(
     instance: Instance<'tcx>,
     source: Span,
 ) -> Spanned<MonoItem<'tcx>> {
-
     respan(source, MonoItem::Fn(instance))
 }
 
@@ -344,7 +368,10 @@ fn create_mono_items_for_default_impls<'tcx>(
         return;
     }
 
-    if tcx.generics_of(item.owner_id).own_requires_monomorphization() {
+    if tcx
+        .generics_of(item.owner_id)
+        .own_requires_monomorphization()
+    {
         return;
     }
 
@@ -386,14 +413,19 @@ fn create_mono_items_for_default_impls<'tcx>(
             continue;
         }
 
-        if tcx.generics_of(method.def_id).own_requires_monomorphization() {
+        if tcx
+            .generics_of(method.def_id)
+            .own_requires_monomorphization()
+        {
             continue;
         }
 
         // As mentioned above, the method is legal to eagerly instantiate if it
         // only has lifetime generic parameters. This is validated by calling
         // `own_requires_monomorphization` on both the impl and method.
-        let args = trait_ref.args.extend_to(tcx, method.def_id, only_region_params);
+        let args = trait_ref
+            .args
+            .extend_to(tcx, method.def_id, only_region_params);
         let instance = ty::Instance::expect_resolve(tcx, typing_env, method.def_id, args, DUMMY_SP);
 
         let mono_item = create_fn_mono_item(tcx, instance, DUMMY_SP);
@@ -411,7 +443,9 @@ struct MonoItems<'tcx> {
 
 impl<'tcx> MonoItems<'tcx> {
     fn new() -> Self {
-        Self { items: FxIndexMap::default() }
+        Self {
+            items: FxIndexMap::default(),
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -434,7 +468,9 @@ impl<'tcx> IntoIterator for MonoItems<'tcx> {
     type IntoIter = impl Iterator<Item = Spanned<MonoItem<'tcx>>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.items.into_iter().map(|(item, span)| respan(span, item))
+        self.items
+            .into_iter()
+            .map(|(item, span)| respan(span, item))
     }
 }
 
