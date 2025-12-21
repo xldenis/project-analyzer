@@ -28,7 +28,9 @@ fn main() {
     run_compiler(&args, &mut ProjectAnalyzer)
 }
 
-use std::{collections::HashMap, env};
+use std::env;
+
+use rustc_middle::ty::TypeVisitableExt;
 
 use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar};
 use rustc_data_structures::fx::FxIndexMap;
@@ -89,13 +91,13 @@ impl Callbacks for ProjectAnalyzer {
             }
 
             println!(
-                "\n{} = {} bytes",
+                "\n{:>6}  {}",
+                size,
                 tcx.def_path_str(instance.def_id()),
-                size
             );
 
             // Analyze the coroutine's contents using the layout
-            analyzer.analyze_coroutine_fields(future_ty, &layout, 0);
+            analyzer.analyze_coroutine_fields(&layout, 0);
         }
 
         Compilation::Continue
@@ -105,8 +107,8 @@ impl Callbacks for ProjectAnalyzer {
 struct CoroutineAnalyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
     typing_env: TypingEnv<'tcx>,
-    // Cache: def_path_hash -> size (to avoid re-analyzing)
-    seen: std::collections::HashSet<String>,
+    // Cache: DefId -> already printed
+    seen: std::collections::HashSet<DefId>,
 }
 
 impl<'tcx> CoroutineAnalyzer<'tcx> {
@@ -120,80 +122,71 @@ impl<'tcx> CoroutineAnalyzer<'tcx> {
 
     fn analyze_coroutine_fields(
         &mut self,
-        _coroutine_ty: Ty<'tcx>,
         layout: &rustc_abi::TyAndLayout<'tcx, Ty<'tcx>>,
         depth: usize,
     ) {
         let tcx = self.tcx;
-        let indent = "  ".repeat(depth);
+        let indent = "  ".repeat(depth + 1);
         let cx = LayoutCx::new(tcx, self.typing_env);
 
-        // Track the largest fields we've seen
-        let mut seen_fields: HashMap<String, (u64, Ty<'tcx>)> = HashMap::new();
+        // Collect all coroutine fields with their sizes
+        let mut coroutine_fields: Vec<(DefId, u64)> = Vec::new();
+
+        let mut collect_fields = |layout: &rustc_abi::TyAndLayout<'tcx, Ty<'tcx>>| {
+            for field_idx in 0..layout.fields.count() {
+                let field_layout = layout.field(&cx, field_idx);
+                let field_ty = field_layout.ty;
+                let field_size = field_layout.size.bytes();
+
+                // Only track coroutines
+                if let ty::Coroutine(def_id, _) = field_ty.kind() {
+                    // Check if we already have this def_id, keep the larger size
+                    if let Some(existing) = coroutine_fields.iter_mut().find(|(d, _)| d == def_id) {
+                        existing.1 = existing.1.max(field_size);
+                    } else {
+                        coroutine_fields.push((*def_id, field_size));
+                    }
+                }
+            }
+        };
 
         match &layout.variants {
             rustc_abi::Variants::Multiple { variants, .. } => {
-                for (variant_idx, _variant_layout) in variants.iter_enumerated() {
+                for (variant_idx, _) in variants.iter_enumerated() {
                     let variant = layout.for_variant(&cx, variant_idx);
-                    for field_idx in 0..variant.fields.count() {
-                        let field_layout = variant.field(&cx, field_idx);
-                        let field_ty = field_layout.ty;
-                        let field_size = field_layout.size.bytes();
-
-                        // Track the largest instance of each type
-                        let key = format!("{field_ty:?}");
-                        seen_fields
-                            .entry(key)
-                            .and_modify(|(s, _)| *s = (*s).max(field_size))
-                            .or_insert((field_size, field_ty));
-                    }
+                    collect_fields(&variant);
                 }
             }
             rustc_abi::Variants::Single { .. } => {
-                for field_idx in 0..layout.fields.count() {
-                    let field_layout = layout.field(&cx, field_idx);
-                    let field_ty = field_layout.ty;
-                    let field_size = field_layout.size.bytes();
-
-                    let key = format!("{field_ty:?}");
-                    seen_fields
-                        .entry(key)
-                        .and_modify(|(s, _)| *s = (*s).max(field_size))
-                        .or_insert((field_size, field_ty));
-                }
+                collect_fields(layout);
             }
-            rustc_abi::Variants::Empty => {
-                // Uninhabited type, no fields to analyze
-            }
+            rustc_abi::Variants::Empty => {}
         }
 
-        // Print the largest captured types
-        let mut fields: Vec<_> = seen_fields.into_iter().collect();
-        fields.sort_by_key(|(_, (size, _))| std::cmp::Reverse(*size));
+        // Sort by size descending
+        coroutine_fields.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
 
-        let mut printed = 0;
-        for (ty_name, (size, ty)) in fields.iter() {
-            if *size > 128 {
-                println!("{indent}  {size:>6} bytes: {ty_name}");
-                printed += 1;
+        // Print and recurse
+        for (def_id, size) in coroutine_fields {
+            let name = tcx.def_path_str(def_id);
+            println!("{indent}{size:>6}  {name}");
 
-                // Recursively analyze nested coroutines
-                if matches!(ty.kind(), ty::Coroutine(..)) {
-                    let key = format!("{ty:?}");
-                    if !self.seen.contains(&key) {
-                        self.seen.insert(key);
-                        if let Ok(nested_layout) = tcx.layout_of(
-                            self.typing_env.as_query_input(*ty)
-                        ) {
-                            self.analyze_coroutine_fields(*ty, &nested_layout, depth + 1);
-                        }
+            // Recursively analyze if not seen
+            if !self.seen.contains(&def_id) {
+                self.seen.insert(def_id);
+
+                // Get the coroutine type and its layout
+                let args = ty::GenericArgs::identity_for_item(tcx, def_id);
+                let coroutine_ty = tcx.type_of(def_id).instantiate(tcx, args);
+
+                if !coroutine_ty.has_param() {
+                    if let Ok(nested_layout) = tcx.layout_of(
+                        self.typing_env.as_query_input(coroutine_ty)
+                    ) {
+                        self.analyze_coroutine_fields(&nested_layout, depth + 1);
                     }
                 }
             }
-        }
-
-        if printed > 10 {
-            println!("{indent}  ... and more fields");
         }
     }
 }
