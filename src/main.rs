@@ -12,6 +12,7 @@ extern crate rustc_middle;
 extern crate rustc_monomorphize;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_ty_utils;
 
 fn main() {
     let handler = EarlyDiagCtxt::new(ErrorOutputType::default());
@@ -29,7 +30,6 @@ fn main() {
 
 use std::{collections::HashMap, env};
 
-use rustc_codegen_ssa::errors;
 use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_driver::{run_compiler, Callbacks, Compilation};
@@ -42,10 +42,11 @@ use rustc_middle::{
     middle::codegen_fn_attrs::CodegenFnAttrFlags,
     mir::{
         self,
-        mono::{CollectionMode, MonoItem},
+        mono::MonoItem,
     },
     ty::{
-        self, layout::ValidityRequirement, GenericArgs, GenericParamDefKind, Instance, Ty, TyCtxt,
+        self, layout::{LayoutCx, ValidityRequirement}, GenericArgs, GenericParamDefKind, Instance, Ty, TyCtxt,
+        TypingEnv,
     },
 };
 use rustc_session::{
@@ -56,157 +57,144 @@ use rustc_session::{
 struct ProjectAnalyzer;
 
 impl Callbacks for ProjectAnalyzer {
-    // fn after_expansion<'tcx>(
-    //     &mut self,
-    //     _compiler: &rustc_interface::interface::Compiler,
-    //     tcx: TyCtxt<'tcx>,
-    // ) -> rustc_driver::Compilation {
-    //     analyze_deps(tcx);
-
-    //     Compilation::Continue
-    // }
-
     fn after_analysis<'tcx>(
         &mut self,
         _compiler: &rustc_interface::interface::Compiler,
         tcx: TyCtxt<'tcx>,
     ) -> Compilation {
         let roots = collect_roots(tcx, MonoItemCollectionStrategy::Eager);
+        let mut analyzer = CoroutineAnalyzer::new(tcx);
 
         for r in roots {
-            match r {
-                MonoItem::Fn(instance) => {
-                    if tcx.asyncness(instance.def_id()) != ty::Asyncness::Yes {
-                        continue;
+            let MonoItem::Fn(instance) = r else { continue };
+
+            if tcx.asyncness(instance.def_id()) != ty::Asyncness::Yes {
+                continue;
+            }
+
+            // Get the fully substituted return type (the future/coroutine)
+            let sig = tcx.fn_sig(instance.def_id()).instantiate(tcx, instance.args);
+            let future_ty = sig.skip_binder().output();
+
+            // Get the layout of the future type
+            let Ok(layout) = tcx.layout_of(
+                TypingEnv::fully_monomorphized().as_query_input(future_ty)
+            ) else {
+                continue;
+            };
+
+            let size = layout.size.bytes();
+            if size < 1000 {
+                continue;
+            }
+
+            println!(
+                "\n{} = {} bytes",
+                tcx.def_path_str(instance.def_id()),
+                size
+            );
+
+            // Analyze the coroutine's contents using the layout
+            analyzer.analyze_coroutine_fields(future_ty, &layout, 0);
+        }
+
+        Compilation::Continue
+    }
+}
+
+struct CoroutineAnalyzer<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    typing_env: TypingEnv<'tcx>,
+    // Cache: def_path_hash -> size (to avoid re-analyzing)
+    seen: std::collections::HashSet<String>,
+}
+
+impl<'tcx> CoroutineAnalyzer<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            typing_env: TypingEnv::fully_monomorphized(),
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    fn analyze_coroutine_fields(
+        &mut self,
+        _coroutine_ty: Ty<'tcx>,
+        layout: &rustc_abi::TyAndLayout<'tcx, Ty<'tcx>>,
+        depth: usize,
+    ) {
+        let tcx = self.tcx;
+        let indent = "  ".repeat(depth);
+        let cx = LayoutCx::new(tcx, self.typing_env);
+
+        // Track the largest fields we've seen
+        let mut seen_fields: HashMap<String, (u64, Ty<'tcx>)> = HashMap::new();
+
+        match &layout.variants {
+            rustc_abi::Variants::Multiple { variants, .. } => {
+                for (variant_idx, _variant_layout) in variants.iter_enumerated() {
+                    let variant = layout.for_variant(&cx, variant_idx);
+                    for field_idx in 0..variant.fields.count() {
+                        let field_layout = variant.field(&cx, field_idx);
+                        let field_ty = field_layout.ty;
+                        let field_size = field_layout.size.bytes();
+
+                        // Track the largest instance of each type
+                        let key = format!("{field_ty:?}");
+                        seen_fields
+                            .entry(key)
+                            .and_modify(|(s, _)| *s = (*s).max(field_size))
+                            .or_insert((field_size, field_ty));
                     }
-
-                    let async_sig = tcx.fn_sig(instance.def_id()).skip_binder();
-
-                    let future_ty = async_sig.output();
-
-                    let Some(unbound_ty) = future_ty.no_bound_vars() else {
-                        // println!("skipping ty {:?}", instance.def_id());
-                        continue;
-                    };
-
-                    let Ok(res) = tcx
-                        .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(unbound_ty))
-                    else {
-                        // println!("skipping ty {future_ty:?}");
-                        continue;
-                    };
-
-                    let ty::TyKind::Alias(_, aty) = unbound_ty.kind() else {
-                        continue;
-                    };
-
-                    if res.size.bytes() < 1000 {
-                        continue;
-                    }
-
-                    let ty::TyKind::Coroutine(id, _) = tcx.type_of(aty.def_id).skip_binder().kind()
-                    else {
-                        continue;
-                    };
-
-                    let has_binders;
-
-                    let coroutine_ty = if let Some(no_binder) = tcx
-                        .coroutine_hidden_types(id)
-                        .no_bound_vars()
-                        .and_then(|b| b.no_bound_vars())
-                    {
-                        has_binders = false;
-                        no_binder
-                    } else {
-                        has_binders = true;
-
-                        tcx.coroutine_hidden_types(id).skip_binder().skip_binder()
-                    };
-
-                    println!(
-                        "captures({:?}) = {} :-",
-                        instance.def_id(),
-                        res.size.bytes()
-                    );
-
-                    use rustc_middle::ty::TypeVisitableExt;
-
-                    let mut skipped_any = false;
-                    for cap_ty in coroutine_ty.types {
-                        if !cap_ty.has_escaping_bound_vars() {
-                            let res = tcx
-                                .layout_of(
-                                    ty::TypingEnv::post_analysis(tcx, instance.def_id())
-                                        .as_query_input(cap_ty),
-                                )
-                                .unwrap();
-                            if res.size.bytes() > 128 {
-                                println!("  size_of({}) = {}", cap_ty, res.size.bytes());
-                            } else {
-                                skipped_any = true
-                            }
-                        } else {
-                            // todo: figure out how to ignore the bound var here without causing a panic
-                            println!("  size_of({}) = ??", cap_ty,);
-
-                            // skipped_any = true
-                        }
-                    }
-
-                    if skipped_any {
-                        println!("  ...");
-                    }
-
-                    println!();
-                    // let x = tcx.items_of_instance((instance, CollectionMode::UsedItems));
-                    // for item in x.0.into_iter().chain(x.1) {
-                    //     *user_map
-                    //         .entry(instance.def_id())
-                    //         .or_default()
-                    //         .entry(item.node)
-                    //         .or_default() += 1;
-
-                    //     // .entry(item.node.def_id()).or_default() += 1;
-                    // }
                 }
-                _ => (),
+            }
+            rustc_abi::Variants::Single { .. } => {
+                for field_idx in 0..layout.fields.count() {
+                    let field_layout = layout.field(&cx, field_idx);
+                    let field_ty = field_layout.ty;
+                    let field_size = field_layout.size.bytes();
+
+                    let key = format!("{field_ty:?}");
+                    seen_fields
+                        .entry(key)
+                        .and_modify(|(s, _)| *s = (*s).max(field_size))
+                        .or_insert((field_size, field_ty));
+                }
+            }
+            rustc_abi::Variants::Empty => {
+                // Uninhabited type, no fields to analyze
             }
         }
 
-        // let mut sorted: Vec<_> = user_map.into_iter().collect();
-        // sorted.sort_by_key(|k| {
-        //     k.1.iter()
-        //         .map(|(m, c)| c * m.size_estimate(tcx))
-        //         .sum::<usize>()
-        // });
-        // sorted.reverse();
-        // // sorted.sort_by_key(|k| k.1.values().sum::<usize>() );
+        // Print the largest captured types
+        let mut fields: Vec<_> = seen_fields.into_iter().collect();
+        fields.sort_by_key(|(_, (size, _))| std::cmp::Reverse(*size));
 
-        // for (k, v) in &sorted[0..1] {
-        //     if !k.is_local() {
-        //         continue;
-        //     }
+        let mut printed = 0;
+        for (ty_name, (size, ty)) in fields.iter() {
+            if *size > 128 {
+                println!("{indent}  {size:>6} bytes: {ty_name}");
+                printed += 1;
 
-        //     eprintln!("{}", tcx.def_path_str(k));
+                // Recursively analyze nested coroutines
+                if matches!(ty.kind(), ty::Coroutine(..)) {
+                    let key = format!("{ty:?}");
+                    if !self.seen.contains(&key) {
+                        self.seen.insert(key);
+                        if let Ok(nested_layout) = tcx.layout_of(
+                            self.typing_env.as_query_input(*ty)
+                        ) {
+                            self.analyze_coroutine_fields(*ty, &nested_layout, depth + 1);
+                        }
+                    }
+                }
+            }
+        }
 
-        //     let mut items: Vec<_> = v.clone().into_iter().collect();
-        //     items.sort_by_key(|(m, c)| c * m.size_estimate(tcx));
-        //     items.reverse();
-        //     for (v, _) in items {
-        //         if let MonoItem::Fn(instance) = v {
-        //             if !instance.def_id().is_local() {
-        //                 continue;
-        //             }
-        //             eprintln!(
-        //                 "  {} {}",
-        //                 tcx.def_path_str_with_args(instance.def_id(), instance.args),
-        //                 tcx.size_estimate(instance)
-        //             )
-        //         }
-        //     }
-        // }
-        Compilation::Continue
+        if printed > 10 {
+            println!("{indent}  ... and more fields");
+        }
     }
 }
 
