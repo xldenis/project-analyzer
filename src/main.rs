@@ -56,72 +56,162 @@ use rustc_session::{
 struct ProjectAnalyzer;
 
 impl Callbacks for ProjectAnalyzer {
-    fn after_expansion<'tcx>(
+    // fn after_expansion<'tcx>(
+    //     &mut self,
+    //     _compiler: &rustc_interface::interface::Compiler,
+    //     tcx: TyCtxt<'tcx>,
+    // ) -> rustc_driver::Compilation {
+    //     analyze_deps(tcx);
+
+    //     Compilation::Continue
+    // }
+
+    fn after_analysis<'tcx>(
         &mut self,
         _compiler: &rustc_interface::interface::Compiler,
         tcx: TyCtxt<'tcx>,
-    ) -> rustc_driver::Compilation {
-        analyze_deps(tcx);
+    ) -> Compilation {
+        let roots = collect_roots(tcx, MonoItemCollectionStrategy::Eager);
 
+        for r in roots {
+            match r {
+                MonoItem::Fn(instance) => {
+                    if tcx.asyncness(instance.def_id()) != ty::Asyncness::Yes {
+                        continue;
+                    }
+
+                    let async_sig = tcx.fn_sig(instance.def_id()).skip_binder();
+
+                    let future_ty = async_sig.output();
+
+                    let Some(unbound_ty) = future_ty.no_bound_vars() else {
+                        // println!("skipping ty {:?}", instance.def_id());
+                        continue;
+                    };
+
+                    let Ok(res) = tcx
+                        .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(unbound_ty))
+                    else {
+                        // println!("skipping ty {future_ty:?}");
+                        continue;
+                    };
+
+                    let ty::TyKind::Alias(_, aty) = unbound_ty.kind() else {
+                        continue;
+                    };
+
+                    if res.size.bytes() < 1000 {
+                        continue;
+                    }
+
+                    let ty::TyKind::Coroutine(id, _) = tcx.type_of(aty.def_id).skip_binder().kind()
+                    else {
+                        continue;
+                    };
+
+                    let has_binders;
+
+                    let coroutine_ty = if let Some(no_binder) = tcx
+                        .coroutine_hidden_types(id)
+                        .no_bound_vars()
+                        .and_then(|b| b.no_bound_vars())
+                    {
+                        has_binders = false;
+                        no_binder
+                    } else {
+                        has_binders = true;
+
+                        tcx.coroutine_hidden_types(id).skip_binder().skip_binder()
+                    };
+
+                    println!(
+                        "captures({:?}) = {} :-",
+                        instance.def_id(),
+                        res.size.bytes()
+                    );
+
+                    use rustc_middle::ty::TypeVisitableExt;
+
+                    let mut skipped_any = false;
+                    for cap_ty in coroutine_ty.types {
+                        if !cap_ty.has_escaping_bound_vars() {
+                            let res = tcx
+                                .layout_of(
+                                    ty::TypingEnv::post_analysis(tcx, instance.def_id())
+                                        .as_query_input(cap_ty),
+                                )
+                                .unwrap();
+                            if res.size.bytes() > 128 {
+                                println!("  size_of({}) = {}", cap_ty, res.size.bytes());
+                            } else {
+                                skipped_any = true
+                            }
+                        } else {
+                            // todo: figure out how to ignore the bound var here without causing a panic
+                            println!("  size_of({}) = ??", cap_ty,);
+
+                            // skipped_any = true
+                        }
+                    }
+
+                    if skipped_any {
+                        println!("  ...");
+                    }
+
+                    println!();
+                    // let x = tcx.items_of_instance((instance, CollectionMode::UsedItems));
+                    // for item in x.0.into_iter().chain(x.1) {
+                    //     *user_map
+                    //         .entry(instance.def_id())
+                    //         .or_default()
+                    //         .entry(item.node)
+                    //         .or_default() += 1;
+
+                    //     // .entry(item.node.def_id()).or_default() += 1;
+                    // }
+                }
+                _ => (),
+            }
+        }
+
+        // let mut sorted: Vec<_> = user_map.into_iter().collect();
+        // sorted.sort_by_key(|k| {
+        //     k.1.iter()
+        //         .map(|(m, c)| c * m.size_estimate(tcx))
+        //         .sum::<usize>()
+        // });
+        // sorted.reverse();
+        // // sorted.sort_by_key(|k| k.1.values().sum::<usize>() );
+
+        // for (k, v) in &sorted[0..1] {
+        //     if !k.is_local() {
+        //         continue;
+        //     }
+
+        //     eprintln!("{}", tcx.def_path_str(k));
+
+        //     let mut items: Vec<_> = v.clone().into_iter().collect();
+        //     items.sort_by_key(|(m, c)| c * m.size_estimate(tcx));
+        //     items.reverse();
+        //     for (v, _) in items {
+        //         if let MonoItem::Fn(instance) = v {
+        //             if !instance.def_id().is_local() {
+        //                 continue;
+        //             }
+        //             eprintln!(
+        //                 "  {} {}",
+        //                 tcx.def_path_str_with_args(instance.def_id(), instance.args),
+        //                 tcx.size_estimate(instance)
+        //             )
+        //         }
+        //     }
+        // }
         Compilation::Continue
     }
-
-    // fn after_analysis<'tcx>(
-    //         &mut self,
-    //         _compiler: &rustc_interface::interface::Compiler,
-    //         tcx: TyCtxt<'tcx>,
-    //     ) -> Compilation {
-    //     let roots = collect_roots(tcx, MonoItemCollectionStrategy::Eager);
-
-    //     let mut user_map : HashMap<DefId, HashMap<MonoItem<'tcx>, usize>> = Default::default();
-    //     for r in roots {
-    //         match r {
-    //             MonoItem::Fn(instance) => {
-    //                 let x = tcx.items_of_instance((instance, CollectionMode::UsedItems));
-    //                 for item in x.0.into_iter().chain(x.1) {
-
-    //                     *user_map.entry(instance.def_id()).or_default()
-    //                         .entry(item.node).or_default() += 1;
-
-    //                     // .entry(item.node.def_id()).or_default() += 1;
-    //                 }
-    //             },
-    //            _ => (),
-    //         }
-    //     }
-
-    //    let mut sorted : Vec<_> = user_map.into_iter().collect();
-    //    sorted.sort_by_key(|k| k.1.iter().map(|(m, c)| c * m.size_estimate(tcx)).sum::<usize>());
-    //    sorted.reverse();
-    //     // sorted.sort_by_key(|k| k.1.values().sum::<usize>() );
-
-    //     for (k, v) in &sorted[0..1] {
-    //         if !k.is_local() {
-    //             continue
-    //         }
-
-    //         eprintln!("{}", tcx.def_path_str(k));
-
-    //         let mut items : Vec<_> = v.clone().into_iter().collect();
-    //         items.sort_by_key(|(m, c)| c * m.size_estimate(tcx));
-    //         items.reverse();
-    //         for (v, _) in items {
-    //             if let MonoItem::Fn(instance) = v {
-    //                 if !instance.def_id().is_local() {
-    //                     continue;
-    //                 }
-    //                 eprintln!("  {} {}", tcx.def_path_str_with_args(instance.def_id(), instance.args), tcx.size_estimate(instance))
-    //             }
-    //         }
-    //     }
-    //     Compilation::Continue
-    // }
 }
 
 fn analyze_deps(tcx: TyCtxt) {
-    let hir = tcx.hir();
-
-    hir.visit_all_item_likes_in_crate(&mut PrintItem(tcx));
+    tcx.hir_visit_all_item_likes_in_crate(&mut PrintItem(tcx));
 }
 
 struct PrintItem<'tcx>(TyCtxt<'tcx>);
@@ -140,6 +230,7 @@ impl<'tcx> Visitor<'tcx> for PrintItem<'tcx> {
         let local_res: Vec<_> = path
             .res
             .iter()
+            .flatten()
             .filter_map(|res| {
                 let is_local = res.opt_def_id().map(|d| d.is_local()).unwrap_or(false);
 
@@ -492,7 +583,7 @@ pub(crate) enum MonoItemCollectionStrategy {
 
 fn collect_const_value<'tcx>(
     tcx: TyCtxt<'tcx>,
-    value: mir::ConstValue<'tcx>,
+    value: mir::ConstValue,
     output: &mut MonoItems<'tcx>,
 ) {
     match value {
@@ -500,11 +591,7 @@ fn collect_const_value<'tcx>(
             collect_alloc(tcx, ptr.provenance.alloc_id(), output)
         }
         mir::ConstValue::Indirect { alloc_id, .. } => collect_alloc(tcx, alloc_id, output),
-        mir::ConstValue::Slice { data, meta: _ } => {
-            for &prov in data.inner().provenance().ptrs().values() {
-                collect_alloc(tcx, prov.alloc_id(), output);
-            }
-        }
+        mir::ConstValue::Slice { meta: _, alloc_id } => collect_alloc(tcx, alloc_id, output),
         _ => {}
     }
 }
@@ -544,6 +631,7 @@ fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoIt
             ));
             collect_alloc(tcx, alloc_id, output)
         }
+        GlobalAlloc::TypeId { .. } => todo!(),
     }
 }
 
@@ -574,7 +662,7 @@ fn visit_instance_use<'tcx>(
             // be lowered in codegen to nothing or a call to panic_nounwind. So if we encounter any
             // of those intrinsics, we need to include a mono item for panic_nounwind, else we may try to
             // codegen a call to that function without generating code for the function itself.
-            let def_id = tcx.require_lang_item(LangItem::PanicNounwind, None);
+            let def_id = tcx.require_lang_item(LangItem::PanicNounwind, DUMMY_SP);
             let panic_instance = Instance::mono(tcx, def_id);
             if tcx.should_codegen_locally(panic_instance) {
                 output.push(create_fn_mono_item(tcx, panic_instance, source));
@@ -584,7 +672,7 @@ fn visit_instance_use<'tcx>(
             // We explicitly skip this otherwise to ensure we get a linker error
             // if anyone tries to call this intrinsic and the codegen backend did not
             // override the implementation.
-            let instance = ty::Instance::new(instance.def_id(), instance.args);
+            let instance = ty::Instance::new_raw(instance.def_id(), instance.args);
             if tcx.should_codegen_locally(instance) {
                 output.push(create_fn_mono_item(tcx, instance, source));
             }
@@ -600,14 +688,15 @@ fn visit_instance_use<'tcx>(
         ty::InstanceKind::ThreadLocalShim(..) => {
             todo!("{:?} being reified", instance);
         }
-        ty::InstanceKind::DropGlue(_, None) | ty::InstanceKind::AsyncDropGlueCtorShim(_, None) => {
+        ty::InstanceKind::DropGlue(_, None) | ty::InstanceKind::AsyncDropGlueCtorShim(_, _) => {
             // Don't need to emit noop drop glue if we are calling directly.
             if !is_direct_call {
                 output.push(create_fn_mono_item(tcx, instance, source));
             }
         }
         ty::InstanceKind::DropGlue(_, Some(_))
-        | ty::InstanceKind::AsyncDropGlueCtorShim(_, Some(_))
+        | ty::InstanceKind::AsyncDropGlue(..)
+        | ty::InstanceKind::FutureDropPollShim(..)
         | ty::InstanceKind::VTableShim(..)
         | ty::InstanceKind::ReifyShim(..)
         | ty::InstanceKind::ClosureOnceShim { .. }
