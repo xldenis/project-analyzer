@@ -17,15 +17,54 @@ extern crate rustc_ty_utils;
 fn main() {
     let handler = EarlyDiagCtxt::new(ErrorOutputType::default());
 
-    // Rust verification tools crash too much for the ice hook to report `full` by default
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         std::env::set_var("RUST_BACKTRACE", "0");
     }
 
     rustc_driver::init_rustc_env_logger(&handler);
-    let args = env::args().collect::<Vec<_>>();
+    let args: Vec<_> = env::args().collect();
 
-    run_compiler(&args, &mut ProjectAnalyzer)
+    // Check for our custom subcommand
+    let mode = env::var("PROJECT_ANALYZER_MODE").unwrap_or_default();
+
+    match mode.as_str() {
+        "dump-mono" => run_compiler(&args, &mut DumpMonoItems),
+        _ => run_compiler(&args, &mut ProjectAnalyzer),
+    }
+}
+
+/// Simple callback that just dumps all mono items
+struct DumpMonoItems;
+
+impl Callbacks for DumpMonoItems {
+    fn after_analysis<'tcx>(
+        &mut self,
+        _compiler: &rustc_interface::interface::Compiler,
+        tcx: TyCtxt<'tcx>,
+    ) -> Compilation {
+        let mono_items = tcx.collect_and_partition_mono_items(());
+
+        for cgu in mono_items.codegen_units.iter() {
+            for (mono_item, _) in cgu.items() {
+                match mono_item {
+                    MonoItem::Fn(instance) => {
+                        let def_id = instance.def_id();
+                        let def_kind = tcx.def_kind(def_id);
+                        let name = tcx.def_path_str(def_id);
+                        println!("Fn | {:?} | {}", def_kind, name);
+                    }
+                    MonoItem::Static(def_id) => {
+                        println!("Static | {}", tcx.def_path_str(*def_id));
+                    }
+                    MonoItem::GlobalAsm(_) => {
+                        println!("GlobalAsm");
+                    }
+                }
+            }
+        }
+
+        Compilation::Continue
+    }
 }
 
 use std::env;
@@ -75,6 +114,14 @@ impl Callbacks for ProjectAnalyzer {
                 let MonoItem::Fn(instance) = mono_item else { continue };
 
                 let def_id = instance.def_id();
+                let name = tcx.def_path_str(def_id);
+
+                // Debug: show all vectors_* mono items
+                if name.contains("vectors_query") {
+                    let def_kind = tcx.def_kind(def_id);
+                    let ty = instance.ty(tcx, TypingEnv::fully_monomorphized());
+                    eprintln!("MONO vectors_query: {} | DefKind={:?} | ty={:?}", name, def_kind, ty.kind());
+                }
 
                 // Check if this is a coroutine (async fn body)
                 if !matches!(tcx.def_kind(def_id), DefKind::Closure) {
@@ -97,6 +144,13 @@ impl Callbacks for ProjectAnalyzer {
                 };
 
                 let size = layout.size.bytes();
+
+                // Debug: show vectors_* functions
+                let name = tcx.def_path_str(*coroutine_def_id);
+                if name.contains("vectors_") {
+                    eprintln!("DEBUG: {} = {} bytes", name, size);
+                }
+
                 if size < 1000 {
                     continue;
                 }
