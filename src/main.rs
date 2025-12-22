@@ -64,40 +64,78 @@ impl Callbacks for ProjectAnalyzer {
         _compiler: &rustc_interface::interface::Compiler,
         tcx: TyCtxt<'tcx>,
     ) -> Compilation {
-        let roots = collect_roots(tcx, MonoItemCollectionStrategy::Eager);
+        let mono_item_partitions = tcx.collect_and_partition_mono_items(());
         let mut analyzer = CoroutineAnalyzer::new(tcx);
 
-        for r in roots {
-            let MonoItem::Fn(instance) = r else { continue };
+        // Collect all coroutines (async fn bodies) with their sizes
+        let mut coroutines: Vec<(DefId, u64)> = Vec::new();
 
-            if tcx.asyncness(instance.def_id()) != ty::Asyncness::Yes {
-                continue;
+        for cgu in mono_item_partitions.codegen_units.iter() {
+            for (mono_item, _) in cgu.items() {
+                let MonoItem::Fn(instance) = mono_item else { continue };
+
+                let def_id = instance.def_id();
+
+                // Check if this is a coroutine (async fn body)
+                if !matches!(tcx.def_kind(def_id), DefKind::Closure) {
+                    continue;
+                }
+
+                // Get the type of this instance
+                let ty = instance.ty(tcx, TypingEnv::fully_monomorphized());
+
+                // Check if it's a coroutine type
+                let ty::Coroutine(coroutine_def_id, _) = ty.kind() else {
+                    continue;
+                };
+
+                // Get the layout
+                let Ok(layout) = tcx.layout_of(
+                    TypingEnv::fully_monomorphized().as_query_input(ty)
+                ) else {
+                    continue;
+                };
+
+                let size = layout.size.bytes();
+                if size < 1000 {
+                    continue;
+                }
+
+                coroutines.push((*coroutine_def_id, size));
             }
+        }
 
-            // Get the fully substituted return type (the future/coroutine)
-            let sig = tcx.fn_sig(instance.def_id()).instantiate(tcx, instance.args);
-            let future_ty = sig.skip_binder().output();
+        // Deduplicate and sort by size descending
+        coroutines.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+        coroutines.dedup_by_key(|(def_id, _)| *def_id);
 
-            // Get the layout of the future type
-            let Ok(layout) = tcx.layout_of(
-                TypingEnv::fully_monomorphized().as_query_input(future_ty)
-            ) else {
-                continue;
-            };
+        for (def_id, size) in coroutines {
+            // Get the parent async fn name if possible
+            let name = tcx.def_path_str(def_id);
 
-            let size = layout.size.bytes();
-            if size < 1000 {
-                continue;
-            }
+            // Clean up the name - remove {closure#N} suffixes to get the async fn name
+            let clean_name = name
+                .split("::{closure")
+                .next()
+                .unwrap_or(&name);
 
             println!(
                 "\n{:>6}  {}",
                 size,
-                tcx.def_path_str(instance.def_id()),
+                clean_name,
             );
 
-            // Analyze the coroutine's contents using the layout
-            analyzer.analyze_coroutine_fields(&layout, 0);
+            // Get the coroutine type and analyze its fields
+            let args = ty::GenericArgs::identity_for_item(tcx, def_id);
+            let coroutine_ty = tcx.type_of(def_id).instantiate(tcx, args);
+
+            if !coroutine_ty.has_param() {
+                if let Ok(layout) = tcx.layout_of(
+                    TypingEnv::fully_monomorphized().as_query_input(coroutine_ty)
+                ) {
+                    analyzer.analyze_coroutine_fields(&layout, 0);
+                }
+            }
         }
 
         Compilation::Continue
