@@ -29,6 +29,7 @@ fn main() {
 
     match mode.as_str() {
         "dump-mono" => run_compiler(&args, &mut DumpMonoItems),
+        "async-graph" => run_compiler(&args, &mut AsyncGraphAnalyzer),
         _ => run_compiler(&args, &mut ProjectAnalyzer),
     }
 }
@@ -67,12 +68,162 @@ impl Callbacks for DumpMonoItems {
     }
 }
 
+/// Analyzes async call graph - depth and size of each async function's call tree
+struct AsyncGraphAnalyzer;
+
+impl Callbacks for AsyncGraphAnalyzer {
+    fn after_analysis<'tcx>(
+        &mut self,
+        _compiler: &rustc_interface::interface::Compiler,
+        tcx: TyCtxt<'tcx>,
+    ) -> Compilation {
+        let mono_items = tcx.collect_and_partition_mono_items(());
+
+        // Step 1: Collect all coroutine instances (these are async fn bodies)
+        let mut coroutines: FxHashMap<DefId, Instance<'tcx>> = FxHashMap::default();
+
+        for cgu in mono_items.codegen_units.iter() {
+            for (mono_item, _) in cgu.items() {
+                let MonoItem::Fn(instance) = mono_item else {
+                    continue;
+                };
+
+                let ty = instance.ty(tcx, TypingEnv::fully_monomorphized());
+                if let ty::Coroutine(def_id, _) = ty.kind() {
+                    coroutines.insert(*def_id, *instance);
+                }
+            }
+        }
+
+        // Step 2: Build call graph by analyzing MIR
+        // Map from coroutine DefId -> set of coroutine DefIds it calls
+        let mut call_graph: FxHashMap<DefId, Vec<DefId>> = FxHashMap::default();
+
+        for (&def_id, &instance) in &coroutines {
+            let callees = collect_async_callees(tcx, instance, &coroutines);
+            call_graph.insert(def_id, callees);
+        }
+
+        // Step 3: Compute depth and size for each coroutine
+        let mut results: Vec<(DefId, usize, usize)> = Vec::new();
+
+        for &def_id in coroutines.keys() {
+            let mut visited = FxHashSet::default();
+            let (depth, size) = compute_graph_metrics(def_id, &call_graph, &mut visited);
+            results.push((def_id, depth, size));
+        }
+
+        // Sort by depth descending, then by size
+        results.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+
+        // Print results
+        println!("{:>6} {:>6}  {}", "DEPTH", "SIZE", "ASYNC FUNCTION");
+        println!("{:->6} {:->6}  {:-<60}", "", "", "");
+
+        for (def_id, depth, size) in results {
+            let name = tcx.def_path_str(def_id);
+            // Clean up the name
+            let clean_name = name.split("::{closure").next().unwrap_or(&name);
+            println!("{:>6} {:>6}  {}", depth, size, clean_name);
+        }
+
+        Compilation::Continue
+    }
+}
+
+/// Collect all async functions (coroutines) that this instance calls
+fn collect_async_callees<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    known_coroutines: &FxHashMap<DefId, Instance<'tcx>>,
+) -> Vec<DefId> {
+    let def_id = instance.def_id();
+
+    // Get the MIR for this instance
+    let mir = if let Some(local_def_id) = def_id.as_local() {
+        tcx.optimized_mir(local_def_id)
+    } else {
+        // For external crates, try to get the MIR if available
+        if tcx.is_mir_available(def_id) {
+            tcx.optimized_mir(def_id)
+        } else {
+            return Vec::new();
+        }
+    };
+
+    let mut callees = Vec::new();
+
+    // Scan all terminators for function calls
+    for bb_data in mir.basic_blocks.iter() {
+        if let mir::TerminatorKind::Call { func, .. } = &bb_data.terminator().kind {
+            // Extract the function being called
+            if let Some((callee_def_id, _)) = func.const_fn_def() {
+                // Check if this is a known coroutine
+                if known_coroutines.contains_key(&callee_def_id) {
+                    callees.push(callee_def_id);
+                }
+
+                // Also check if it's an async fn (the coroutine is nested inside)
+                // The actual coroutine DefId is a child of the async fn's DefId
+                for (&coro_def_id, _) in known_coroutines {
+                    if let Some(parent) = tcx.opt_parent(coro_def_id) {
+                        if parent == callee_def_id {
+                            callees.push(coro_def_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Dedup using a set since DefId doesn't impl Ord
+    let callees: Vec<_> = callees
+        .into_iter()
+        .collect::<FxHashSet<_>>()
+        .into_iter()
+        .collect();
+    callees
+}
+
+/// Compute the maximum depth and total size of the call graph starting from this node
+fn compute_graph_metrics(
+    root: DefId,
+    call_graph: &FxHashMap<DefId, Vec<DefId>>,
+    visited: &mut FxHashSet<DefId>,
+) -> (usize, usize) {
+    if visited.contains(&root) {
+        return (0, 0); // Already counted, don't count again
+    }
+
+    visited.insert(root);
+
+    let callees = match call_graph.get(&root) {
+        Some(c) => c,
+        None => return (1, 1), // Leaf node
+    };
+
+    if callees.is_empty() {
+        return (1, 1); // Leaf node
+    }
+
+    let mut max_child_depth = 0;
+    let mut total_size = 1; // Count this node
+
+    for &callee in callees {
+        let (child_depth, child_size) = compute_graph_metrics(callee, call_graph, visited);
+        max_child_depth = max_child_depth.max(child_depth);
+        total_size += child_size;
+    }
+
+    (1 + max_child_depth, total_size)
+}
+
 use std::env;
 
 use rustc_middle::ty::TypeVisitableExt;
 
 use rustc_const_eval::interpret::{AllocId, GlobalAlloc, Scalar};
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_driver::{run_compiler, Callbacks, Compilation};
 use rustc_hir::{self as hir, LangItem};
 use rustc_hir::{
@@ -81,13 +232,11 @@ use rustc_hir::{
 };
 use rustc_middle::{
     middle::codegen_fn_attrs::CodegenFnAttrFlags,
-    mir::{
-        self,
-        mono::MonoItem,
-    },
+    mir::{self, mono::MonoItem},
     ty::{
-        self, layout::{LayoutCx, ValidityRequirement}, GenericArgs, GenericParamDefKind, Instance, Ty, TyCtxt,
-        TypingEnv,
+        self,
+        layout::{LayoutCx, ValidityRequirement},
+        GenericArgs, GenericParamDefKind, Instance, Ty, TyCtxt, TypingEnv,
     },
 };
 use rustc_session::{
@@ -111,7 +260,9 @@ impl Callbacks for ProjectAnalyzer {
 
         for cgu in mono_item_partitions.codegen_units.iter() {
             for (mono_item, _) in cgu.items() {
-                let MonoItem::Fn(instance) = mono_item else { continue };
+                let MonoItem::Fn(instance) = mono_item else {
+                    continue;
+                };
 
                 let def_id = instance.def_id();
                 let name = tcx.def_path_str(def_id);
@@ -120,7 +271,12 @@ impl Callbacks for ProjectAnalyzer {
                 if name.contains("vectors_query") {
                     let def_kind = tcx.def_kind(def_id);
                     let ty = instance.ty(tcx, TypingEnv::fully_monomorphized());
-                    eprintln!("MONO vectors_query: {} | DefKind={:?} | ty={:?}", name, def_kind, ty.kind());
+                    eprintln!(
+                        "MONO vectors_query: {} | DefKind={:?} | ty={:?}",
+                        name,
+                        def_kind,
+                        ty.kind()
+                    );
                 }
 
                 // Check if this is a coroutine (async fn body)
@@ -137,9 +293,8 @@ impl Callbacks for ProjectAnalyzer {
                 };
 
                 // Get the layout
-                let Ok(layout) = tcx.layout_of(
-                    TypingEnv::fully_monomorphized().as_query_input(ty)
-                ) else {
+                let Ok(layout) = tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(ty))
+                else {
                     continue;
                 };
 
@@ -168,25 +323,18 @@ impl Callbacks for ProjectAnalyzer {
             let name = tcx.def_path_str(def_id);
 
             // Clean up the name - remove {closure#N} suffixes to get the async fn name
-            let clean_name = name
-                .split("::{closure")
-                .next()
-                .unwrap_or(&name);
+            let clean_name = name.split("::{closure").next().unwrap_or(&name);
 
-            println!(
-                "\n{:>6}  {}",
-                size,
-                clean_name,
-            );
+            println!("\n{:>6}  {}", size, clean_name,);
 
             // Get the coroutine type and analyze its fields
             let args = ty::GenericArgs::identity_for_item(tcx, def_id);
             let coroutine_ty = tcx.type_of(def_id).instantiate(tcx, args);
 
             if !coroutine_ty.has_param() {
-                if let Ok(layout) = tcx.layout_of(
-                    TypingEnv::fully_monomorphized().as_query_input(coroutine_ty)
-                ) {
+                if let Ok(layout) =
+                    tcx.layout_of(TypingEnv::fully_monomorphized().as_query_input(coroutine_ty))
+                {
                     analyzer.analyze_coroutine_fields(&layout, 0);
                 }
             }
@@ -272,9 +420,9 @@ impl<'tcx> CoroutineAnalyzer<'tcx> {
                 let coroutine_ty = tcx.type_of(def_id).instantiate(tcx, args);
 
                 if !coroutine_ty.has_param() {
-                    if let Ok(nested_layout) = tcx.layout_of(
-                        self.typing_env.as_query_input(coroutine_ty)
-                    ) {
+                    if let Ok(nested_layout) =
+                        tcx.layout_of(self.typing_env.as_query_input(coroutine_ty))
+                    {
                         self.analyze_coroutine_fields(&nested_layout, depth + 1);
                     }
                 }
